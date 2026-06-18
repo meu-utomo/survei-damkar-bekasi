@@ -10,11 +10,12 @@ return new class extends Migration {
      */
     public function up(): void
     {
-        Schema::create('qualitative_responses', function (Blueprint $table) {
+        Schema::create('parameter_options', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('respondent_id')->constrained('respondents')->onDelete('cascade');
-            $table->boolean('is_tpp_fair');
-            $table->text('testimonial')->nullable();
+            $table->enum('parameter_type', ['E', 'P', 'C'])->comment('E = Exposure, P = Probability, C = Consequence');
+            $table->decimal('score', 5, 2);
+            $table->string('label');
+            $table->text('description')->nullable();
             $table->timestamps();
         });
     }
@@ -24,6 +25,6 @@ return new class extends Migration {
      */
     public function down(): void
     {
-        Schema::dropIfExists('qualitative_responses');
+        Schema::dropIfExists('parameter_options');
     }
 };

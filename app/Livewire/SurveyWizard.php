@@ -4,6 +4,8 @@ namespace App\Livewire;
 
 use Livewire\Component;
 use App\Models\Respondent;
+use App\Models\HazardScenario;
+use App\Models\ParameterOption;
 use App\Models\HazardResponse;
 use App\Models\InjuryHistory;
 use App\Models\QualitativeResponse;
@@ -11,13 +13,13 @@ use Illuminate\Support\Facades\DB;
 
 class SurveyWizard extends Component
 {
-    // Mengatur halaman aktif (Step 1: Diri, Step 2-8: Skenario, Step 9: Cedera, Step 10: Aspirasi, Step 11: Sukses)
+    // Pengendali Langkah Wizard (1: Diri, 2: Soal Dinamis, 3: Risiko Kustom, 4: Evaluasi Kustom, 5: Cedera, 6: Aspirasi, 11: Sukses)
     public $currentStep = 1;
-    public $totalSteps = 11;
+    public $totalSteps = 6;
 
     // Profil Responden
     public $name_initial;
-    public $respondent_group = 'pasukan';
+    public $respondent_group = 'pasukan'; // Default, akan diubah responden di Step 1
     public $employee_status;
     public $class_rank;
     public $age_group;
@@ -25,63 +27,189 @@ class SurveyWizard extends Component
     public $work_unit;
     public $role_type;
 
-    // Data Penilaian Risiko 7 Skenario Bahaya Lapangan
-    public $scenarios = [
-        1 => ['title' => 'Asap Tebal & Gas Beracun Industri', 'E' => null, 'P' => null, 'C' => null],
-        2 => ['title' => 'Api Besar & Panas Ekstrem di Kawasan Industri', 'E' => null, 'P' => null, 'C' => null],
-        3 => ['title' => 'Ancaman Beton/Atap Runtuh & Ledakan Susulan', 'E' => null, 'P' => null, 'C' => null],
-        4 => ['title' => 'Kebakaran di Gang Sempit & Kawasan Padat Penduduk', 'E' => null, 'P' => null, 'C' => null],
-        5 => ['title' => 'Risiko Kecelakaan Kecepatan Tinggi Saat Evakuasi di Jalan Tol', 'E' => null, 'P' => null, 'C' => null],
-        6 => ['title' => 'Evakuasi Tawon Vespa, Ular Kobra, dan Hewan Liar Berbisa', 'E' => null, 'P' => null, 'C' => null],
-        7 => ['title' => 'Penyelamatan & Evakuasi Korban Tenggelam di Arus Deras (Water Rescue)', 'E' => null, 'P' => null, 'C' => null],
-    ];
+    // Parameter Opsi (Dimuat dari DB)
+    public $exposureOptions = [];
+    public $probabilityOptions = [];
+    public $consequenceOptions = [];
 
-    // Riwayat Cedera Medis
+    // Kuesioner Skenario Terpilih (Dimuat dinamis setelah Step 1)
+    public $activeScenarios = [];
+    public $answers = [];
+
+    // Risiko Kustom Responden (Step 3 & 4)
+    public $hasCustomRisk = 'no';
+    public $customTitle;
+    public $customDescription;
+    public $customScenarios = [];
+
+    // Cedera & Aspirasi (Step 5 & 6)
     public $selected_injuries = [];
     public $custom_injury;
-
-    // Aspirasi Akhir
     public $is_tpp_fair;
     public $testimonial;
 
-    // Aturan Validasi Khusus per Langkah Aktif
-    public function getRules()
+    /**
+     * Memuat daftar parameter pilihan di awal aplikasi dijalankan
+     */
+    public function mount()
+    {
+        $this->exposureOptions = ParameterOption::where('parameter_type', 'E')->get()->toArray();
+        $this->probabilityOptions = ParameterOption::where('parameter_type', 'P')->get()->toArray();
+        $this->consequenceOptions = ParameterOption::where('parameter_type', 'C')->get()->toArray();
+    }
+
+    /**
+     * Memfilter dan memuat pertanyaan kuesioner secara dinamis setelah Step 1 Selesai
+     */
+    public function loadDynamicQuestions()
+    {
+        // Kueri database menyaring soal yang memiliki target_group sesuai dengan pilihan responden
+        $this->activeScenarios = HazardScenario::where('is_approved', true)
+            ->whereIn('target_group', [$this->respondent_group, 'umum'])
+            ->get()
+            ->toArray();
+
+        // Inisialisasi ulang array jawaban
+        $this->answers = [];
+        foreach ($this->activeScenarios as $scenario) {
+            $this->answers[$scenario['id']] = [
+                'E' => null,
+                'P' => null,
+                'C' => null
+            ];
+        }
+
+        // Reset riwayat cedera agar tidak tumpang tindih saat responden mengubah status grup
+        $this->selected_injuries = [];
+    }
+
+    public function addCustomScenario()
+    {
+        $this->validate([
+            'customTitle' => 'required|string|max:150',
+            'customDescription' => 'required|string|min:10',
+        ]);
+
+        $newScenario = HazardScenario::create([
+            'category' => 'tambahan',
+            'target_group' => $this->respondent_group,
+            'title' => $this->customTitle,
+            'description' => $this->customDescription,
+            'is_approved' => false,
+        ]);
+
+        $this->customScenarios[] = [
+            'id' => $newScenario->id,
+            'title' => $newScenario->title,
+            'description' => $newScenario->description,
+            'E' => null,
+            'P' => null,
+            'C' => null
+        ];
+
+        $this->customTitle = '';
+        $this->customDescription = '';
+    }
+
+    public function removeCustomScenario($index)
+    {
+        $scenarioId = $this->customScenarios[$index]['id'];
+        HazardScenario::destroy($scenarioId);
+
+        unset($this->customScenarios[$index]);
+        $this->customScenarios = array_values($this->customScenarios);
+    }
+
+    /**
+     * Mengembalikan daftar opsi cedera yang dinonaktifkan/diaktifkan berdasarkan kelompok
+     */
+    public function getInjuryOptionsProperty()
+    {
+        if ($this->respondent_group === 'manajemen') {
+            return [
+                'Mata Lelah / Perih (Terlalu lama menatap layar komputer)',
+                'Nyeri Otot Punggung / Low Back Pain (Duduk menyusun berkas laporan)',
+                'Sakit Kepala Kronis / Migrain (Tekanan deadline laporan keuangan)',
+                'Asam Lambung Naik / Mag (Stres menyusun berkas pertanggungjawaban dinas)',
+                'Kecemasan Berlebih / Ansietas (Khawatir temuan atau audit anggaran)',
+            ];
+        }
+
+        return [
+            'Dehidrasi parah / heat exhaustion akibat panas kobaran api',
+            'Luka bakar di bagian wajah atau kulit luar',
+            'Luka robek / tertusuk material paku dan kawat bangunan runtuh',
+            'Sesak napas akut akibat menghirup asap tebal zat kimia',
+            'Penyakit paru-paru basah / sesak napas kronis jangka panjang',
+            'Digigit ular kobra berbisa / sengatan tawon vespa saat evakuasi',
+            'Patah tulang / dislokasi sendi akibat jatuh dari ketinggian',
+            'Stres fisik ekstrem / pusing kepala akibat piket siaga darurat',
+        ];
+    }
+
+    public function validateStep()
     {
         if ($this->currentStep === 1) {
-            return [
+            $this->validate([
+                'respondent_group' => 'required',
                 'employee_status' => 'required',
-                'class_rank' => 'required|string|max:50',
+                'class_rank' => 'required|string',
                 'age_group' => 'required',
                 'years_of_service' => 'required',
-                'work_unit' => 'required|string|max:100',
+                'work_unit' => 'required|string',
                 'role_type' => 'required',
-            ];
+            ]);
+
+            // Pemicu pemuatan soal dinamis
+            $this->loadDynamicQuestions();
         }
 
-        // Validasi Skenario (Langkah 2 sampai 8)
-        if ($this->currentStep >= 2 && $this->currentStep <= 8) {
-            $scenarioId = $this->currentStep - 1;
-            return [
-                "scenarios.{$scenarioId}.E" => 'required|numeric',
-                "scenarios.{$scenarioId}.P" => 'required|numeric',
-                "scenarios.{$scenarioId}.C" => 'required|numeric',
-            ];
+        if ($this->currentStep === 2) {
+            foreach ($this->activeScenarios as $scenario) {
+                $id = $scenario['id'];
+                $this->validate([
+                    "answers.{$id}.E" => 'required',
+                    "answers.{$id}.P" => 'required',
+                    "answers.{$id}.C" => 'required',
+                ], [
+                    "answers.{$id}.E.required" => "Penilaian Paparan untuk '{$scenario['title']}' wajib dipilih.",
+                    "answers.{$id}.P.required" => "Penilaian Kemungkinan untuk '{$scenario['title']}' wajib dipilih.",
+                    "answers.{$id}.C.required" => "Penilaian Dampak untuk '{$scenario['title']}' wajib dipilih.",
+                ]);
+            }
         }
 
-        // Validasi Riwayat Cedera (Langkah 9 - Opsional, boleh kosong jika mencentang 'Tidak pernah')
-        if ($this->currentStep === 9) {
-            return [
+        if ($this->currentStep === 4 && count($this->customScenarios) > 0) {
+            foreach ($this->customScenarios as $index => $cs) {
+                $this->validate([
+                    "customScenarios.{$index}.E" => 'required',
+                    "customScenarios.{$index}.P" => 'required',
+                    "customScenarios.{$index}.C" => 'required',
+                ], [
+                    "customScenarios.{$index}.E.required" => "Paparan untuk risiko tambahan '{$cs['title']}' wajib dipilih.",
+                    "customScenarios.{$index}.P.required" => "Kemungkinan untuk risiko tambahan '{$cs['title']}' wajib dipilih.",
+                    "customScenarios.{$index}.C.required" => "Konsekuensi untuk risiko tambahan '{$cs['title']}' wajib dipilih.",
+                ]);
+            }
+        }
+
+        if ($this->currentStep === 5) {
+            $this->validate([
                 'selected_injuries' => 'required|array|min:1',
-            ];
+            ]);
         }
-
-        return [];
     }
 
     public function nextStep()
     {
-        // Validasi data sebelum diizinkan pindah ke langkah berikutnya
-        $this->validate($this->getRules());
+        $this->validateStep();
+
+        if ($this->currentStep === 3) {
+            if ($this->hasCustomRisk === 'no' || count($this->customScenarios) === 0) {
+                $this->currentStep = 5; // Langsung lompat ke riwayat cedera
+                return;
+            }
+        }
 
         if ($this->currentStep < $this->totalSteps) {
             $this->currentStep++;
@@ -90,14 +218,16 @@ class SurveyWizard extends Component
 
     public function prevStep()
     {
+        if ($this->currentStep === 5 && ($this->hasCustomRisk === 'no' || count($this->customScenarios) === 0)) {
+            $this->currentStep = 3;
+            return;
+        }
+
         if ($this->currentStep > 1) {
             $this->currentStep--;
         }
     }
 
-    /**
-     * Menyimpan seluruh berkas jawaban survei ke dalam database secara transaksional.
-     */
     public function saveSurvey()
     {
         $this->validate([
@@ -106,7 +236,7 @@ class SurveyWizard extends Component
         ]);
 
         DB::transaction(function () {
-            // 1. Simpan Identitas Responden
+            // 1. Simpan Responden
             $respondent = Respondent::create([
                 'name_initial' => $this->name_initial ?: 'ANON',
                 'respondent_group' => $this->respondent_group,
@@ -119,34 +249,48 @@ class SurveyWizard extends Component
                 'submitted_at' => now(),
             ]);
 
-            // 2. Simpan Jawaban 7 Skenario Risiko (Kalkulasi otomatis dipicu oleh event Model)
-            foreach ($this->scenarios as $id => $data) {
-                HazardResponse::create([
-                    'respondent_id' => $respondent->id,
-                    'hazard_scenario_id' => $id,
-                    'exposure_score' => $data['E'],
-                    'probability_score' => $data['P'],
-                    'consequence_score' => $data['C'],
+            // Kaitkan ID draf kustom dengan ID responden
+            if (count($this->customScenarios) > 0) {
+                $createdIds = collect($this->customScenarios)->pluck('id');
+                HazardScenario::whereIn('id', $createdIds)->update([
+                    'created_by_respondent_id' => $respondent->id
                 ]);
             }
 
-            // 3. Simpan Riwayat Cedera Medis
+            // 2. Simpan Jawaban Soal Master
+            foreach ($this->answers as $scenarioId => $data) {
+                HazardResponse::create([
+                    'respondent_id' => $respondent->id,
+                    'hazard_scenario_id' => $scenarioId,
+                    'exposure_option_id' => $data['E'],
+                    'probability_option_id' => $data['P'],
+                    'consequence_option_id' => $data['C'],
+                ]);
+            }
+
+            // 3. Simpan Jawaban Soal Kustom
+            if ($this->hasCustomRisk === 'yes' && count($this->customScenarios) > 0) {
+                foreach ($this->customScenarios as $cs) {
+                    HazardResponse::create([
+                        'respondent_id' => $respondent->id,
+                        'hazard_scenario_id' => $cs['id'],
+                        'exposure_option_id' => $cs['E'],
+                        'probability_option_id' => $cs['P'],
+                        'consequence_option_id' => $cs['C'],
+                    ]);
+                }
+            }
+
+            // 4. Simpan Riwayat Cedera
             foreach ($this->selected_injuries as $injury) {
                 InjuryHistory::create([
                     'respondent_id' => $respondent->id,
                     'injury_type' => $injury,
-                    'is_custom' => false,
-                ]);
-            }
-            if ($this->custom_injury) {
-                InjuryHistory::create([
-                    'respondent_id' => $respondent->id,
-                    'injury_type' => $this->custom_injury,
-                    'is_custom' => true,
+                    'description' => $injury === 'Lainnya' ? $this->custom_injury : null,
                 ]);
             }
 
-            // 4. Simpan Aspirasi Finansial Kualitatif
+            // 5. Simpan Aspirasi
             QualitativeResponse::create([
                 'respondent_id' => $respondent->id,
                 'is_tpp_fair' => $this->is_tpp_fair === 'yes',
@@ -154,7 +298,7 @@ class SurveyWizard extends Component
             ]);
         });
 
-        $this->currentStep = 11; // Pengalihan akhir ke halaman Sukses
+        $this->currentStep = 11; // Halaman sukses
     }
 
     public function render()
